@@ -1,0 +1,94 @@
+name: PR dependency and secret security audit
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Audit npm packages
+        shell: bash
+        run: |
+          set -u
+          mkdir -p security-results
+          while IFS= read -r file; do
+            dir=$(dirname "$file")
+            name=$(printf '%s' "$dir" | sed 's/[^a-zA-Z0-9]/_/g')
+            if [ ! -f "$dir/package-lock.json" ]; then echo "Missing lockfile in $dir" >> security-results/errors.txt; continue; fi
+            (cd "$dir" && npm audit --json --omit=dev > "$GITHUB_WORKSPACE/security-results/${name}.json") || true
+          done < <(find . -name package.json -not -path '*/node_modules/*' -not -path '*/.git/*')
+      - name: Scan git history for secrets
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 --silent --show-error https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz -o /tmp/gitleaks.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          /tmp/gitleaks git . --report-format json --report-path security-results/secrets.json --exit-code 0
+      - name: Prepare severity-ranked comment
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import glob,json,os,pathlib
+          levels=['critical','high','moderate','low','info']
+          findings={x:[] for x in levels}
+          errors=[]
+          for path in glob.glob('security-results/*.json'):
+              if path.endswith('/secrets.json'): continue
+              try:
+                  data=json.load(open(path))
+                  if data.get('error'): errors.append(path+': '+str(data['error'])[:120])
+                  for name,v in data.get('vulnerabilities',{}).items():
+                      sev=str(v.get('severity','info')).lower()
+                      if sev not in findings: sev='info'
+                      via=v.get('via',[])
+                      ids=[str(x.get('url','')) for x in via if isinstance(x,dict) and x.get('url')]
+                      findings[sev].append((name,str(v.get('range','?')),ids[0] if ids else ''))
+              except Exception as exc: errors.append(path+': '+str(exc)[:120])
+          if pathlib.Path('security-results/errors.txt').exists(): errors += pathlib.Path('security-results/errors.txt').read_text().splitlines()
+          lines=['## PR security audit','', 'Severity summary: '+', '.join('**%s: %d**'%(k.title(),len(findings[k])) for k in levels), '']
+          for k in levels:
+              lines+=['### '+k.title()+' ('+str(len(findings[k]))+')','']
+              for name,version,url in findings[k][:50]:
+                  lines.append('- `%s` affected range `%s` %s'%(name.replace('`',''),version.replace('`',''),url))
+              if len(findings[k])>50: lines.append('- Additional findings in audit artifacts.')
+              if not findings[k]: lines.append('None reported.')
+              lines.append('')
+          leaks=[]
+          try: leaks=json.load(open('security-results/secrets.json'))
+          except FileNotFoundError: errors.append('Secret scan report missing')
+          except Exception as exc: errors.append('Secret report parse: '+str(exc)[:120])
+          lines+=['### Potential secrets ('+str(len(leaks))+')','']
+          for leak in leaks[:30]:
+              lines.append('- `%s` at `%s:%s` (secret values hidden)'%(leak.get('RuleID','unknown'),leak.get('File','?'),leak.get('StartLine','?')))
+          if not leaks: lines.append('None reported.')
+          if errors: lines+=['','### Scanner errors']+['- '+e for e in errors]
+          lines+=['','Critical findings and potential secrets require attention before merge. Other severities are shown for visibility.','', '[Workflow logs](https://github.com/%s/actions/runs/%s)'%(os.environ['GITHUB_REPOSITORY'],os.environ['GITHUB_RUN_ID'])]
+          pathlib.Path('security-comment.md').write_text('\n'.join(lines)+'\n')
+          pathlib.Path('security-results/blocking.txt').write_text('1' if findings['critical'] or leaks or errors else '0')
+          PY
+      - name: Upload security details
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit
+          path: |
+            security-results/
+            security-comment.md
+      - name: Post new report comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr comment "$PR_NUMBER" --body-file security-comment.md
+      - name: Block critical vulnerabilities and leaked secrets
+        if: always()
+        run: test "$(cat security-results/blocking.txt)" = "0"
